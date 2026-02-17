@@ -93,6 +93,7 @@ type Path string
 const (
 	PathDirectIPv4    Path = "direct_ipv4"
 	PathDirectIPv6    Path = "direct_ipv6"
+	PathWebRTC        Path = "webrtc"
 	PathDERP          Path = "derp"
 	PathPeerRelayIPv4 Path = "peer_relay_ipv4"
 	PathPeerRelayIPv6 Path = "peer_relay_ipv6"
@@ -108,6 +109,19 @@ type pathLabel struct {
 	Path Path
 }
 
+// webrtcReadResult is the result of reading a packet from a WebRTC data channel.
+// It is similar to derpReadResult but for WebRTC connections.
+type webrtcReadResult struct {
+	n   int            // length of data received
+	src key.NodePublic // sender's node public key
+	// copyBuf is called to copy the data to dst. It returns how
+	// much data was copied, which will be n if dst is large
+	// enough. copyBuf can only be called once.
+	// If copyBuf is nil, that's a signal from the sender to ignore
+	// this message.
+	copyBuf func(dst []byte) int
+}
+
 // metrics in wgengine contains the usermetrics counters for magicsock, it
 // is however a bit special. All them metrics are labeled, but looking up
 // the metric everytime we need to record it has an overhead, and includes
@@ -118,6 +132,7 @@ type metrics struct {
 	// labeled by the path the packet took.
 	inboundPacketsIPv4Total          expvar.Int
 	inboundPacketsIPv6Total          expvar.Int
+	inboundPacketsWebRTCTotal        expvar.Int
 	inboundPacketsDERPTotal          expvar.Int
 	inboundPacketsPeerRelayIPv4Total expvar.Int
 	inboundPacketsPeerRelayIPv6Total expvar.Int
@@ -126,6 +141,7 @@ type metrics struct {
 	// labeled by the path the packet took.
 	inboundBytesIPv4Total          expvar.Int
 	inboundBytesIPv6Total          expvar.Int
+	inboundBytesWebRTCTotal        expvar.Int
 	inboundBytesDERPTotal          expvar.Int
 	inboundBytesPeerRelayIPv4Total expvar.Int
 	inboundBytesPeerRelayIPv6Total expvar.Int
@@ -134,6 +150,7 @@ type metrics struct {
 	// labeled by the path the packet took.
 	outboundPacketsIPv4Total          expvar.Int
 	outboundPacketsIPv6Total          expvar.Int
+	outboundPacketsWebRTCTotal        expvar.Int
 	outboundPacketsDERPTotal          expvar.Int
 	outboundPacketsPeerRelayIPv4Total expvar.Int
 	outboundPacketsPeerRelayIPv6Total expvar.Int
@@ -142,6 +159,7 @@ type metrics struct {
 	// labeled by the path the packet took.
 	outboundBytesIPv4Total          expvar.Int
 	outboundBytesIPv6Total          expvar.Int
+	outboundBytesWebRTCTotal        expvar.Int
 	outboundBytesDERPTotal          expvar.Int
 	outboundBytesPeerRelayIPv4Total expvar.Int
 	outboundBytesPeerRelayIPv6Total expvar.Int
@@ -207,6 +225,10 @@ type Conn struct {
 	// derpRecvCh is used by receiveDERP to read DERP messages.
 	// It must have buffer size > 0; see issue 3736.
 	derpRecvCh chan derpReadResult
+
+	// webrtcRecvCh is used by receiveWebRTC to read WebRTC messages.
+	// It must have buffer size > 0, similar to derpRecvCh.
+	webrtcRecvCh chan webrtcReadResult
 
 	// bind is the wireguard-go conn.Bind for Conn.
 	bind *connBind
@@ -339,6 +361,10 @@ type Conn struct {
 	// relayManager manages allocation and handshaking of
 	// [tailscale.com/net/udprelay.Server] endpoints.
 	relayManager relayManager
+
+	// webrtcMgr manages WebRTC connections for peers.
+	// May be nil if WebRTC is disabled (no TS_DEBUG_WEBRTC_SIGNALING_URL).
+	webrtcMgr *webrtcManager
 
 	// discoInfo is the state for an active peer DiscoKey.
 	discoInfo map[key.DiscoPublic]*discoInfo
@@ -554,7 +580,8 @@ func newConn(logf logger.Logf) *Conn {
 	discoPrivate := key.NewDisco()
 	c := &Conn{
 		logf:         logf,
-		derpRecvCh:   make(chan derpReadResult, 1), // must be buffered, see issue 3736
+		derpRecvCh:   make(chan derpReadResult, 1),   // must be buffered, see issue 3736
+		webrtcRecvCh: make(chan webrtcReadResult, 1), // must be buffered, similar to derpRecvCh
 		derpStarted:  make(chan struct{}),
 		peerLastDerp: make(map[key.NodePublic]int),
 		peerMap:      newPeerMap(),
@@ -701,6 +728,16 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c.logf("magicsock: disco key = %v", c.discoAtomic.Short())
+
+	// Initialize WebRTC manager if signaling server URL is set
+	if signalingURL := debugWebRTCSignalingURL(); signalingURL != "" {
+		c.logf("magicsock: initializing WebRTC with signaling server %s", signalingURL)
+		c.webrtcMgr = newWebRTCManager(c, signalingURL)
+		if c.webrtcMgr == nil {
+			c.logf("magicsock: failed to initialize WebRTC manager")
+		}
+	}
+
 	return c, nil
 }
 
@@ -710,6 +747,7 @@ func NewConn(opts Options) (*Conn, error) {
 func registerMetrics(reg *usermetric.Registry) *metrics {
 	pathDirectV4 := pathLabel{Path: PathDirectIPv4}
 	pathDirectV6 := pathLabel{Path: PathDirectIPv6}
+	pathWebRTC := pathLabel{Path: PathWebRTC}
 	pathDERP := pathLabel{Path: PathDERP}
 	pathPeerRelayV4 := pathLabel{Path: PathPeerRelayIPv4}
 	pathPeerRelayV6 := pathLabel{Path: PathPeerRelayIPv6}
@@ -744,21 +782,25 @@ func registerMetrics(reg *usermetric.Registry) *metrics {
 	// Map clientmetrics to the usermetric counters.
 	metricRecvDataPacketsIPv4.Register(&m.inboundPacketsIPv4Total)
 	metricRecvDataPacketsIPv6.Register(&m.inboundPacketsIPv6Total)
+	metricRecvDataPacketsWebRTC.Register(&m.inboundPacketsWebRTCTotal)
 	metricRecvDataPacketsDERP.Register(&m.inboundPacketsDERPTotal)
 	metricRecvDataPacketsPeerRelayIPv4.Register(&m.inboundPacketsPeerRelayIPv4Total)
 	metricRecvDataPacketsPeerRelayIPv6.Register(&m.inboundPacketsPeerRelayIPv6Total)
 	metricRecvDataBytesIPv4.Register(&m.inboundBytesIPv4Total)
 	metricRecvDataBytesIPv6.Register(&m.inboundBytesIPv6Total)
+	metricRecvDataBytesWebRTC.Register(&m.inboundBytesWebRTCTotal)
 	metricRecvDataBytesDERP.Register(&m.inboundBytesDERPTotal)
 	metricRecvDataBytesPeerRelayIPv4.Register(&m.inboundBytesPeerRelayIPv4Total)
 	metricRecvDataBytesPeerRelayIPv6.Register(&m.inboundBytesPeerRelayIPv6Total)
 	metricSendDataPacketsIPv4.Register(&m.outboundPacketsIPv4Total)
 	metricSendDataPacketsIPv6.Register(&m.outboundPacketsIPv6Total)
+	metricSendDataPacketsWebRTC.Register(&m.outboundPacketsWebRTCTotal)
 	metricSendDataPacketsDERP.Register(&m.outboundPacketsDERPTotal)
 	metricSendDataPacketsPeerRelayIPv4.Register(&m.outboundPacketsPeerRelayIPv4Total)
 	metricSendDataPacketsPeerRelayIPv6.Register(&m.outboundPacketsPeerRelayIPv6Total)
 	metricSendDataBytesIPv4.Register(&m.outboundBytesIPv4Total)
 	metricSendDataBytesIPv6.Register(&m.outboundBytesIPv6Total)
+	metricSendDataBytesWebRTC.Register(&m.outboundBytesWebRTCTotal)
 	metricSendDataBytesDERP.Register(&m.outboundBytesDERPTotal)
 	metricSendDataBytesPeerRelayIPv4.Register(&m.outboundBytesPeerRelayIPv4Total)
 	metricSendDataBytesPeerRelayIPv6.Register(&m.outboundBytesPeerRelayIPv6Total)
@@ -770,24 +812,28 @@ func registerMetrics(reg *usermetric.Registry) *metrics {
 
 	inboundPacketsTotal.Set(pathDirectV4, &m.inboundPacketsIPv4Total)
 	inboundPacketsTotal.Set(pathDirectV6, &m.inboundPacketsIPv6Total)
+	inboundPacketsTotal.Set(pathWebRTC, &m.inboundPacketsWebRTCTotal)
 	inboundPacketsTotal.Set(pathDERP, &m.inboundPacketsDERPTotal)
 	inboundPacketsTotal.Set(pathPeerRelayV4, &m.inboundPacketsPeerRelayIPv4Total)
 	inboundPacketsTotal.Set(pathPeerRelayV6, &m.inboundPacketsPeerRelayIPv6Total)
 
 	inboundBytesTotal.Set(pathDirectV4, &m.inboundBytesIPv4Total)
 	inboundBytesTotal.Set(pathDirectV6, &m.inboundBytesIPv6Total)
+	inboundBytesTotal.Set(pathWebRTC, &m.inboundBytesWebRTCTotal)
 	inboundBytesTotal.Set(pathDERP, &m.inboundBytesDERPTotal)
 	inboundBytesTotal.Set(pathPeerRelayV4, &m.inboundBytesPeerRelayIPv4Total)
 	inboundBytesTotal.Set(pathPeerRelayV6, &m.inboundBytesPeerRelayIPv6Total)
 
 	outboundPacketsTotal.Set(pathDirectV4, &m.outboundPacketsIPv4Total)
 	outboundPacketsTotal.Set(pathDirectV6, &m.outboundPacketsIPv6Total)
+	outboundPacketsTotal.Set(pathWebRTC, &m.outboundPacketsWebRTCTotal)
 	outboundPacketsTotal.Set(pathDERP, &m.outboundPacketsDERPTotal)
 	outboundPacketsTotal.Set(pathPeerRelayV4, &m.outboundPacketsPeerRelayIPv4Total)
 	outboundPacketsTotal.Set(pathPeerRelayV6, &m.outboundPacketsPeerRelayIPv6Total)
 
 	outboundBytesTotal.Set(pathDirectV4, &m.outboundBytesIPv4Total)
 	outboundBytesTotal.Set(pathDirectV6, &m.outboundBytesIPv6Total)
+	outboundBytesTotal.Set(pathWebRTC, &m.outboundBytesWebRTCTotal)
 	outboundBytesTotal.Set(pathDERP, &m.outboundBytesDERPTotal)
 	outboundBytesTotal.Set(pathPeerRelayV4, &m.outboundBytesPeerRelayIPv4Total)
 	outboundBytesTotal.Set(pathPeerRelayV6, &m.outboundBytesPeerRelayIPv6Total)
@@ -802,21 +848,25 @@ func registerMetrics(reg *usermetric.Registry) *metrics {
 func deregisterMetrics() {
 	metricRecvDataPacketsIPv4.UnregisterAll()
 	metricRecvDataPacketsIPv6.UnregisterAll()
+	metricRecvDataPacketsWebRTC.UnregisterAll()
 	metricRecvDataPacketsDERP.UnregisterAll()
 	metricRecvDataPacketsPeerRelayIPv4.UnregisterAll()
 	metricRecvDataPacketsPeerRelayIPv6.UnregisterAll()
 	metricRecvDataBytesIPv4.UnregisterAll()
 	metricRecvDataBytesIPv6.UnregisterAll()
+	metricRecvDataBytesWebRTC.UnregisterAll()
 	metricRecvDataBytesDERP.UnregisterAll()
 	metricRecvDataBytesPeerRelayIPv4.UnregisterAll()
 	metricRecvDataBytesPeerRelayIPv6.UnregisterAll()
 	metricSendDataPacketsIPv4.UnregisterAll()
 	metricSendDataPacketsIPv6.UnregisterAll()
+	metricSendDataPacketsWebRTC.UnregisterAll()
 	metricSendDataPacketsDERP.UnregisterAll()
 	metricSendDataPacketsPeerRelayIPv4.UnregisterAll()
 	metricSendDataPacketsPeerRelayIPv6.UnregisterAll()
 	metricSendDataBytesIPv4.UnregisterAll()
 	metricSendDataBytesIPv6.UnregisterAll()
+	metricSendDataBytesWebRTC.UnregisterAll()
 	metricSendDataBytesDERP.UnregisterAll()
 	metricSendDataBytesPeerRelayIPv4.UnregisterAll()
 	metricSendDataBytesPeerRelayIPv6.UnregisterAll()
@@ -1594,6 +1644,9 @@ func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) 
 // IPv6 address when the local machine doesn't have IPv6 support
 // returns (false, nil); it's not an error, but nothing was sent.
 func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
+	if addr.Addr() == tailcfg.WebRTCMagicIPAddr {
+		return c.sendWebRTC(addr, pubKey, b)
+	}
 	if addr.Addr() != tailcfg.DerpMagicIPAddr {
 		return c.sendUDP(addr, b, isDisco, isGeneveEncap)
 	}
@@ -1633,6 +1686,110 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, is
 	metricSendDERPErrorQueue.Add(1)
 	// Too many writes queued. Drop packet.
 	return false, errDropDerpPacket
+}
+
+// sendWebRTC sends a packet over WebRTC data channel.
+func (c *Conn) sendWebRTC(addr netip.AddrPort, pubKey key.NodePublic, b []byte) (sent bool, err error) {
+	if c.webrtcMgr == nil {
+		return false, nil
+	}
+
+	// Find the endpoint by public key
+	c.mu.Lock()
+	ep, ok := c.peerMap.endpointForNodeKey(pubKey)
+	c.mu.Unlock()
+
+	if !ok {
+		return false, nil
+	}
+
+	// Get the disco key for this endpoint
+	disco := ep.disco.Load()
+	if disco == nil {
+		return false, nil
+	}
+
+	// Send via WebRTC manager
+	if err := c.webrtcMgr.sendPacket(disco.key, b); err != nil {
+		return false, err
+	}
+
+	// Update metrics
+	c.metrics.outboundPacketsWebRTCTotal.Add(1)
+	c.metrics.outboundBytesWebRTCTotal.Add(int64(len(b)))
+
+	return true, nil
+}
+
+// receiveWebRTC handles packets received from WebRTC data channels.
+// This is called by webrtcManager when data arrives on a data channel.
+// receiveWebRTC is called by webrtcManager when data arrives on a WebRTC data channel.
+// It queues the packet for processing by wireguard-go through the webrtcRecvCh channel.
+func (c *Conn) receiveWebRTC(b []byte, srcNodeKey key.NodePublic) {
+	// Make a copy of the data since the buffer will be reused
+	copied := append([]byte(nil), b...)
+
+	// Queue the packet for wireguard-go processing
+	select {
+	case c.webrtcRecvCh <- webrtcReadResult{
+		n:   len(copied),
+		src: srcNodeKey,
+		copyBuf: func(dst []byte) int {
+			return copy(dst, copied)
+		},
+	}:
+	case <-c.connCtx.Done():
+		// Connection closed, drop the packet
+	default:
+		// Channel full, drop the packet
+		c.logf("webrtc: dropped packet from %v, receive channel full", srcNodeKey.ShortString())
+	}
+}
+
+// processWebRTCReadResult processes a WebRTC packet received from the webrtcRecvCh.
+// It's similar to processDERPReadResult but for WebRTC packets.
+func (c *Conn) processWebRTCReadResult(wr webrtcReadResult, b []byte) (n int, ep *endpoint) {
+	if wr.copyBuf == nil {
+		return 0, nil
+	}
+
+	n = wr.n
+	ncopy := wr.copyBuf(b)
+	if ncopy != n {
+		err := fmt.Errorf("received WebRTC packet of length %d that's too big for WireGuard buf size %d", n, ncopy)
+		c.logf("magicsock: %v", err)
+		return 0, nil
+	}
+
+	srcAddr := epAddr{ap: netip.AddrPortFrom(tailcfg.WebRTCMagicIPAddr, 12345)}
+
+	// Check if this looks like a disco packet
+	pt, isGeneveEncap := packetLooksLike(b[:n])
+	if pt == packetLooksLikeDisco && !isGeneveEncap {
+		c.handleDiscoMessage(b[:n], srcAddr, false, wr.src, discoRXPathWebRTC)
+		return 0, nil
+	}
+
+	// Find the endpoint by node key
+	var ok bool
+	c.mu.Lock()
+	ep, ok = c.peerMap.endpointForNodeKey(wr.src)
+	c.mu.Unlock()
+
+	if !ok {
+		// We don't know anything about this node key
+		return 0, nil
+	}
+
+	ep.noteRecvActivity(srcAddr, mono.Now())
+	if update := c.connCounter.Load(); update != nil {
+		update(0, netip.AddrPortFrom(ep.nodeAddr, 0), srcAddr.ap, 1, n, true)
+	}
+
+	c.metrics.inboundPacketsWebRTCTotal.Add(1)
+	c.metrics.inboundBytesWebRTCTotal.Add(int64(n))
+
+	return n, ep
 }
 
 type receiveBatch struct {
@@ -1969,7 +2126,7 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 			if !dstKey.IsZero() {
 				node = dstKey.ShortString()
 			}
-			c.dlogf("[v1] magicsock: disco: %v->%v (%v, %v) sent %v len %v\n", c.discoAtomic.Short(), dstDisco.ShortString(), node, derpStr(dst.String()), disco.MessageSummary(m), len(pkt))
+			c.dlogf("[v1] magicsock: disco: %v->%v (%v, %v) sent %v len %v\n", c.discoAtomic.Short(), dstDisco.ShortString(), node, pathStr(dst.String()), disco.MessageSummary(m), len(pkt))
 		}
 		if isDERP {
 			metricSentDiscoDERP.Add(1)
@@ -2009,6 +2166,7 @@ type discoRXPath string
 const (
 	discoRXPathUDP       discoRXPath = "UDP socket"
 	discoRXPathDERP      discoRXPath = "DERP"
+	discoRXPathWebRTC    discoRXPath = "WebRTC"
 	discoRXPathRawSocket discoRXPath = "raw socket"
 )
 
@@ -2320,13 +2478,13 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 		if isVia {
 			c.dlogf("[v1] magicsock: disco: %v<-%v via %v (%v, %v)  got call-me-maybe-via, %d endpoints",
 				c.discoAtomic.Short(), epDisco.short, via.ServerDisco.ShortString(),
-				ep.publicKey.ShortString(), derpStr(src.String()),
+				ep.publicKey.ShortString(), pathStr(src.String()),
 				len(via.AddrPorts))
 			c.relayManager.handleCallMeMaybeVia(ep, lastBest, lastBestIsTrusted, via)
 		} else {
 			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got call-me-maybe, %d endpoints",
 				c.discoAtomic.Short(), epDisco.short,
-				ep.publicKey.ShortString(), derpStr(src.String()),
+				ep.publicKey.ShortString(), pathStr(src.String()),
 				len(cmm.MyNumber))
 			go ep.handleCallMeMaybe(cmm)
 		}
@@ -2372,7 +2530,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 		if isResp {
 			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v) got %s, %d endpoints",
 				c.discoAtomic.Short(), epDisco.short,
-				ep.publicKey.ShortString(), derpStr(src.String()),
+				ep.publicKey.ShortString(), pathStr(src.String()),
 				msgType,
 				len(resp.AddrPorts))
 			c.relayManager.handleRxDiscoMsg(c, resp, nodeKey, di.discoKey, src)
@@ -2386,7 +2544,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 		} else {
 			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v) got %s disco[0]=%v disco[1]=%v",
 				c.discoAtomic.Short(), epDisco.short,
-				ep.publicKey.ShortString(), derpStr(src.String()),
+				ep.publicKey.ShortString(), pathStr(src.String()),
 				msgType,
 				req.ClientDisco[0].ShortString(), req.ClientDisco[1].ShortString())
 		}
@@ -3071,6 +3229,11 @@ func (c *Conn) updateNodes(self tailcfg.NodeView, peers []tailcfg.NodeView) (pee
 			}
 			ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
 			c.peerMap.upsertEndpoint(ep, oldDiscoKey) // maybe update discokey mappings in peerMap
+
+			// Start WebRTC connection if not already started
+			if c.webrtcMgr != nil && !n.DiscoKey().IsZero() {
+				c.webrtcMgr.startConnection(ep)
+			}
 			continue
 		}
 
@@ -3131,6 +3294,11 @@ func (c *Conn) updateNodes(self tailcfg.NodeView, peers []tailcfg.NodeView) (pee
 
 		ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
 		c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+
+		// Start WebRTC connection to this peer if WebRTC is enabled
+		if c.webrtcMgr != nil && !n.DiscoKey().IsZero() {
+			c.webrtcMgr.startConnection(ep)
+		}
 	}
 
 	// If the set of nodes changed since the last SetNetworkMap, the
@@ -3248,9 +3416,9 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 		return nil, 0, errors.New("magicsock: connBind already open")
 	}
 	c.closed = false
-	fns := []conn.ReceiveFunc{c.receiveIPv4(), c.receiveIPv6(), c.receiveDERP}
+	fns := []conn.ReceiveFunc{c.receiveIPv4(), c.receiveIPv6(), c.receiveDERP, c.receiveWebRTC}
 	if runtime.GOOS == "js" {
-		fns = []conn.ReceiveFunc{c.receiveDERP}
+		fns = []conn.ReceiveFunc{c.receiveDERP, c.receiveWebRTC}
 	}
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
 	// closure that closes over a *RebindingUDPConn?
@@ -3326,6 +3494,14 @@ func (c *Conn) Close() error {
 	c.peerMap.forEachEndpoint(func(ep *endpoint) {
 		ep.stopAndReset()
 	})
+
+	// Close WebRTC manager if initialized
+	if c.webrtcMgr != nil {
+		c.webrtcMgr.close()
+		c.webrtcMgr = nil
+	}
+
+	close(c.webrtcRecvCh)
 
 	c.closed = true
 	c.connCtxCancel()
@@ -3881,8 +4057,19 @@ func trySetUDPSocketOptions(pconn nettype.PacketConn, logf logger.Logf) {
 	}
 }
 
+// pathStr formats endpoint addresses for display, replacing magic IPs with readable names.
+// It replaces DERP IPs with "derp-" and WebRTC IPs with "webrtc-".
+func pathStr(s string) string {
+	s = derpStr(s)
+	s = webrtcStr(s)
+	return s
+}
+
 // derpStr replaces DERP IPs in s with "derp-".
 func derpStr(s string) string { return strings.ReplaceAll(s, "127.3.3.40:", "derp-") }
+
+// webrtcStr replaces WebRTC IPs in s with "webrtc-".
+func webrtcStr(s string) string { return strings.ReplaceAll(s, "127.3.3.41:", "webrtc-") }
 
 // epAddrEndpointCache is a mutex-free single-element cache, mapping from
 // a single [epAddr] to a single [*endpoint].
@@ -3964,11 +4151,13 @@ var (
 	metricRecvDataPacketsDERP          = clientmetric.NewAggregateCounter("magicsock_recv_data_derp")
 	metricRecvDataPacketsIPv4          = clientmetric.NewAggregateCounter("magicsock_recv_data_ipv4")
 	metricRecvDataPacketsIPv6          = clientmetric.NewAggregateCounter("magicsock_recv_data_ipv6")
+	metricRecvDataPacketsWebRTC        = clientmetric.NewAggregateCounter("magicsock_recv_data_webrtc")
 	metricRecvDataPacketsPeerRelayIPv4 = clientmetric.NewAggregateCounter("magicsock_recv_data_peer_relay_ipv4")
 	metricRecvDataPacketsPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_recv_data_peer_relay_ipv6")
 	metricSendDataPacketsDERP          = clientmetric.NewAggregateCounter("magicsock_send_data_derp")
 	metricSendDataPacketsIPv4          = clientmetric.NewAggregateCounter("magicsock_send_data_ipv4")
 	metricSendDataPacketsIPv6          = clientmetric.NewAggregateCounter("magicsock_send_data_ipv6")
+	metricSendDataPacketsWebRTC        = clientmetric.NewAggregateCounter("magicsock_send_data_webrtc")
 	metricSendDataPacketsPeerRelayIPv4 = clientmetric.NewAggregateCounter("magicsock_send_data_peer_relay_ipv4")
 	metricSendDataPacketsPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_send_data_peer_relay_ipv6")
 
@@ -3976,11 +4165,13 @@ var (
 	metricRecvDataBytesDERP          = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_derp")
 	metricRecvDataBytesIPv4          = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_ipv4")
 	metricRecvDataBytesIPv6          = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_ipv6")
+	metricRecvDataBytesWebRTC        = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_webrtc")
 	metricRecvDataBytesPeerRelayIPv4 = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_peer_relay_ipv4")
 	metricRecvDataBytesPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_peer_relay_ipv6")
 	metricSendDataBytesDERP          = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_derp")
 	metricSendDataBytesIPv4          = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_ipv4")
 	metricSendDataBytesIPv6          = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_ipv6")
+	metricSendDataBytesWebRTC        = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_webrtc")
 	metricSendDataBytesPeerRelayIPv4 = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_peer_relay_ipv4")
 	metricSendDataBytesPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_peer_relay_ipv6")
 
@@ -4098,6 +4289,16 @@ func (c *Conn) GetLastNetcheckReport(ctx context.Context) *netcheck.Report {
 // Used for testing purposes.
 func (c *Conn) SetLastNetcheckReportForTest(ctx context.Context, report *netcheck.Report) {
 	c.lastNetCheckReport.Store(report)
+}
+
+// findEndpointByDisco returns the first endpoint with the given disco key, or nil if not found.
+func (c *Conn) findEndpointByDisco(dk key.DiscoPublic) *endpoint {
+	var found *endpoint
+	c.peerMap.forEachEndpointWithDiscoKey(dk, func(ep *endpoint) bool {
+		found = ep
+		return false // stop after first match
+	})
+	return found
 }
 
 // lazyEndpoint is a wireguard [conn.Endpoint] for when magicsock received a
